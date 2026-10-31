@@ -1,0 +1,801 @@
+import asyncio
+import os
+import re
+import shutil
+from pathlib import Path
+from telethon import TelegramClient
+from colorama import init, Fore, Style
+from prettytable import PrettyTable
+
+init(autoreset=True)
+
+# Kredensial Telegram
+API_ID = int(os.getenv("TELEGRAM_API_ID", "1234567"))
+API_HASH = os.getenv("TELEGRAM_API_HASH", "your_api_hash_here")
+BOT_USERNAME = "@shp_tools_bot"
+
+# Path File Utama
+ACCOUNTS_FILE = Path("account.txt")
+MISSION_FILE = Path("mission.txt")
+FINGERPRINT_FILE = Path("fingerprint.txt")
+
+# Index rotasi fingerprint global
+fp_index = 0
+
+# Daftar Voucher Food & Ongkir
+VOUCHERS = {
+    "NEWFOODIES": "https://shopee.co.id/voucher/details?evcode=NEWFOODIES&infocuan&promotionId=1535384308957184&signature=9d5740e39dedc95c5aeb12ae7ed5455e1163bcbb2f659624052c33b633baf853",
+    "ONGKIRGRATIS": "https://shopee.co.id/voucher/details?evcode=ONGKIRGRATIS&infocuan&promotionId=1535384308826112&signature=b675a8f1d1b61eb8bec9d565cfe99871b7d45c8aef6bb88dc0d7a5c8f1372205",
+}
+
+# Daftar Link Voucher Deals (Alfamart & Indomaret)
+DEALS_VOUCHERS = {
+    "1": ("Alfamart 25k", "https://id.shp.ee/DCeFuUqz"),
+    "2": ("Alfamart 50k", "https://id.shp.ee/YV64naN4"),
+    "3": ("Alfamart 100k", "https://id.shp.ee/3ogFQ3xD"),
+    "4": ("Indomaret 25k", "https://id.shp.ee/DNh4WHtw"),
+    "5": ("Indomaret 50k", "https://id.shp.ee/DDGa9whJ"),
+    "6": ("Indomaret 100k", "https://id.shp.ee/yh8aKDr3"),
+}
+
+# File Output Penyimpanan Hasil Sukses
+OUTPUTS = {name: Path(f"reedem_{name}.txt") for name in VOUCHERS}
+OUTPUTS["CHECKIN"] = Path("reedem_checkin.txt")
+OUTPUTS["GANTI_NOMOR"] = Path("reedem_gantinomor.txt")
+OUTPUTS["DAFTAR"] = Path("reedem_daftar.txt")
+OUTPUTS["VA"] = Path("VA.txt")
+OUTPUTS["DEALS"] = Path("reedem_deals.txt")
+
+client = TelegramClient("session_claimer", API_ID, API_HASH)
+
+
+def read_unique_lines(path):
+    if not path.exists():
+        return []
+    return list(dict.fromkeys(line.strip() for line in path.read_text(encoding="utf-8-sig").splitlines() if line.strip()))
+
+
+def save_unique_success(path, data_str):
+    existing = read_unique_lines(path)
+    if data_str not in existing:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(data_str + "\n")
+
+
+def get_next_fingerprint():
+    """Mengambil baris fingerprint secara bergantian (rotasi) dari file fingerprint.txt"""
+    global fp_index
+    fps = read_unique_lines(FINGERPRINT_FILE)
+    if not fps:
+        return None
+    selected_fp = fps[fp_index % len(fps)]
+    fp_index += 1
+    return selected_fp
+
+
+async def click_button_by_keywords(keywords, after_id=0):
+    for _ in range(12):
+        messages = await client.get_messages(BOT_USERNAME, limit=12)
+        for msg in messages:
+            if not msg.out and (after_id == 0 or msg.id > after_id) and msg.buttons:
+                for row in msg.buttons:
+                    for button in row:
+                        label = (button.text or "").lower()
+                        if any(k in label for k in keywords):
+                            await button.click()
+                            return msg.id
+        await asyncio.sleep(2)
+    return None
+
+
+async def wait_for_bot_prompt(phrases, after_id=0, timeout=35):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        messages = await client.get_messages(BOT_USERNAME, limit=15)
+        for msg in messages:
+            if msg.out or (after_id > 0 and msg.id <= after_id):
+                continue
+            content = (msg.raw_text or "").casefold()
+            if any(phrase in content for phrase in phrases):
+                return msg.id
+        await asyncio.sleep(2)
+    return None
+
+
+async def process_auto_register(is_first_run=True, last_msg_id=0):
+    """1. /account -> Daftar Akun -> Nomor Otomatis -> Fingerprint Custom -> Daftarkan Ulang Nomor / Handle Cooldown"""
+    try:
+        current_after_id = last_msg_id
+
+        async def start_fresh_register():
+            sent = await client.send_message(BOT_USERNAME, "/account")
+            b_id = await click_button_by_keywords(["daftar akun"], sent.id)
+            if b_id is None:
+                b_id = sent.id
+            auto_num_id = await click_button_by_keywords(["nomor otomatis"], b_id)
+            return auto_num_id or b_id
+
+        if is_first_run or current_after_id == 0:
+            current_after_id = await start_fresh_register()
+        else:
+            relist_id = None
+            for retry in range(3):
+                relist_id = await click_button_by_keywords(["daftarkan ulang nomor", "daftar ulang"], 0)
+                await asyncio.sleep(2)
+                
+                messages = await client.get_messages(BOT_USERNAME, limit=5)
+                cooldown_found = False
+                for msg in messages:
+                    raw_text = (msg.raw_text or "").casefold()
+                    if "cooldown otp" in raw_text or "tunggu" in raw_text:
+                        cooldown_found = True
+                        match = re.search(r"tunggu\s+(\d+)\s+detik", raw_text)
+                        wait_seconds = int(match.group(1)) + 2 if match else 35
+                        print(Fore.YELLOW + f"[!] Cooldown OTP terdeteksi, menunggu {wait_seconds} detik...")
+                        await asyncio.sleep(wait_seconds)
+                        break
+
+                if not cooldown_found:
+                    break
+
+            if relist_id is None:
+                current_after_id = await start_fresh_register()
+            else:
+                current_after_id = relist_id
+
+        fp_clicked = False
+        fp_sent = False
+
+        for _ in range(90):
+            await asyncio.sleep(2)
+            messages = await client.get_messages(BOT_USERNAME, limit=15)
+            replies = [msg for msg in messages if not msg.out and msg.id > current_after_id]
+            if not replies:
+                continue
+
+            full_text = "\n".join([(m.raw_text or "").casefold() for m in replies])
+
+            if "tidak bisa didaftarkan ulang" in full_text or "terhubung ke akun lain" in full_text or "tidak bisa dipakai" in full_text:
+                current_after_id = await start_fresh_register()
+                fp_clicked = False
+                fp_sent = False
+                continue
+
+            if not fp_clicked:
+                for msg in replies:
+                    if msg.buttons:
+                        for row in msg.buttons:
+                            for btn in row:
+                                if "fingerprint custom" in (btn.text or "").lower():
+                                    await btn.click()
+                                    fp_clicked = True
+                                    current_after_id = msg.id
+                                    break
+
+            if (fp_clicked or "kirim fingerprint custom" in full_text) and not fp_sent:
+                custom_fp = get_next_fingerprint()
+                if not custom_fp:
+                    return False, current_after_id
+
+                await asyncio.sleep(2)
+                sent_fp = await client.send_message(BOT_USERNAME, custom_fp)
+                fp_sent = True
+                current_after_id = sent_fp.id
+
+            if fp_sent:
+                for msg in replies:
+                    raw = msg.raw_text or ""
+                    raw_lower = raw.casefold()
+                    success_indicators = ["berhasil", "username:", "password:", "userid:", "order id:"]
+                    if any(indicator in raw_lower for indicator in success_indicators):
+                        acc_info = "SUKSES_REGISTER"
+                        for line in raw.splitlines():
+                            if "username:" in line.lower() or "nomor:" in line.lower():
+                                acc_info = line.split(":", 1)[1].strip()
+                                break
+                        
+                        save_unique_success(OUTPUTS["DAFTAR"], acc_info)
+                        return True, msg.id
+
+                if "gagal" in full_text or "kuota habis" in full_text or "saldo tidak cukup" in full_text:
+                    return False, current_after_id
+
+        return False, current_after_id
+    except Exception:
+        return False, 0
+
+
+async def process_mission_checkin(username):
+    """2. /mission -> Misi Checkin -> Filter Ketat QRIS 15K Belum Selesai"""
+    try:
+        sent = await client.send_message(BOT_USERNAME, "/mission")
+        button_id = await click_button_by_keywords(["misi checkin"], sent.id)
+        if button_id is None:
+            return False
+
+        button_id = await click_button_by_keywords(["email", "username", "user id"], button_id)
+        if button_id is None:
+            return False
+
+        prompt_id = await wait_for_bot_prompt(
+            ["masukkan email", "kirim email", "masukkan username", "kirim username",
+             "masukkan id", "kirim id", "email / username / id", "email/username/id"],
+            after_id=button_id,
+        )
+        if prompt_id is None:
+            return False
+
+        await asyncio.sleep(2)
+        sent = await client.send_message(BOT_USERNAME, username)
+
+        for _ in range(15):
+            await asyncio.sleep(2)
+            messages = await client.get_messages(BOT_USERNAME, limit=15)
+            replies = [msg for msg in messages if not msg.out and msg.id > sent.id and msg.raw_text and msg.raw_text.strip()]
+            if not replies:
+                continue
+
+            full_reply_text = "\n".join([msg.raw_text.casefold() for msg in replies])
+
+            if "otp" in full_reply_text:
+                await click_button_by_keywords(["batal"], replies[0].id)
+                return False
+
+            if "misi checkin" in full_reply_text or "bayar qris" in full_reply_text:
+                lines = full_reply_text.splitlines()
+                qris_success = False
+
+                for line in lines:
+                    if "bayar qris" in line:
+                        is_uncompleted = "belum selesai" in line
+                        has_target_koin = ("10.000 koin" in line or "10000 koin" in line or 
+                                           "5.000 koin" in line or "5000 koin" in line)
+                        if is_uncompleted and has_target_koin:
+                            qris_success = True
+                            break
+
+                if qris_success:
+                    save_unique_success(OUTPUTS["CHECKIN"], username)
+                    return True
+                else:
+                    return False
+
+        return False
+    except Exception:
+        return False
+
+
+async def process_change_number(username):
+    """3. /account -> Ganti Nomor -> Filter Password & PIN ShopeePay"""
+    try:
+        sent = await client.send_message(BOT_USERNAME, "/account")
+        button_id = await click_button_by_keywords(["ganti nomor"], sent.id)
+        if button_id is None:
+            return False
+
+        button_id = await click_button_by_keywords(["email", "username", "user id"], button_id)
+        if button_id is None:
+            return False
+
+        prompt_id = await wait_for_bot_prompt(
+            ["masukkan email", "kirim email", "masukkan username", "kirim username",
+             "masukkan id", "kirim id", "email / username / id", "email/username/id"],
+            after_id=button_id,
+        )
+        if prompt_id is None:
+            return False
+
+        await asyncio.sleep(2)
+        sent = await client.send_message(BOT_USERNAME, username)
+
+        for _ in range(15):
+            await asyncio.sleep(2)
+            messages = await client.get_messages(BOT_USERNAME, limit=15)
+            replies = [msg for msg in messages if not msg.out and msg.id > sent.id and msg.raw_text and msg.raw_text.strip()]
+            if not replies:
+                continue
+
+            for msg in replies:
+                reply = msg.raw_text.casefold()
+
+                if "otp akan dikirim" in reply or "verifikasi lewat otp" in reply or "otp" in reply:
+                    await click_button_by_keywords(["batal"], msg.id)
+                    return False
+                
+                if "pilih metode" in reply or "butuh verifikasi identitas" in reply:
+                    has_password_or_pin = False
+                    if msg.buttons:
+                        for row in msg.buttons:
+                            for btn in row:
+                                btn_txt = (btn.text or "").lower()
+                                if "password" in btn_txt or "pin shopeepay" in btn_txt:
+                                    has_password_or_pin = True
+                                    break
+
+                    if has_password_or_pin:
+                        await click_button_by_keywords(["batal"], msg.id)
+                        save_unique_success(OUTPUTS["GANTI_NOMOR"], username)
+                        return True
+                    else:
+                        await click_button_by_keywords(["batal"], msg.id)
+                        return False
+
+            return False
+
+        return False
+    except Exception:
+        return False
+
+
+async def process_claim_voucher(username, voucher_name, voucher_link):
+    """Check Voucher (Food + Ongkir)"""
+    try:
+        sent = await client.send_message(BOT_USERNAME, "/account")
+        button_id = await click_button_by_keywords(["claim voucher"], sent.id)
+        if button_id is None:
+            return False
+
+        prompt_id = await wait_for_bot_prompt(
+            ["kirim link voucher", "masukkan link voucher", "kirimkan link voucher"],
+            after_id=button_id,
+        )
+        if prompt_id is None:
+            return False
+
+        await asyncio.sleep(2)
+        sent = await client.send_message(BOT_USERNAME, voucher_link)
+        button_id = await click_button_by_keywords(["email", "username", "user id"], sent.id)
+        if button_id is None:
+            return False
+
+        prompt_id = await wait_for_bot_prompt(
+            ["masukkan email", "kirim email", "masukkan username", "kirim username",
+             "masukkan id", "kirim id", "email / username / id", "email/username/id"],
+            after_id=button_id,
+        )
+        if prompt_id is None:
+            return False
+
+        await asyncio.sleep(2)
+        sent = await client.send_message(BOT_USERNAME, username)
+
+        for _ in range(30):
+            await asyncio.sleep(2)
+            messages = await client.get_messages(BOT_USERNAME, limit=15)
+            replies = [msg for msg in messages if not msg.out and msg.id > sent.id and msg.raw_text and msg.raw_text.strip()]
+            if not replies:
+                continue
+            msg = min(replies, key=lambda item: item.id)
+            reply = msg.raw_text.casefold()
+            if "berhasil diklaim" in reply:
+                save_unique_success(OUTPUTS[voucher_name], username)
+                return True
+            return False
+
+        return False
+    except Exception:
+        return False
+
+
+async def process_pln_token(username, pln_meter_number):
+    """4. /digital -> Token Spay -> Email / Username / ID -> Send Username -> Wait Full Login -> Click PLN 20.000 -> Send Meter"""
+    try:
+        sent_digital = await client.send_message(BOT_USERNAME, '/digital')
+        
+        btn_spay_id = await click_button_by_keywords(['token spay'], sent_digital.id)
+        if not btn_spay_id:
+            return False
+            
+        btn_login_method_id = await click_button_by_keywords(['email / username', 'email', 'username', 'id'], 0)
+        if not btn_login_method_id:
+            return False
+
+        prompt_id = await wait_for_bot_prompt(['masukkan email', 'masukkan username', 'user id'], after_id=0)
+        if not prompt_id:
+            return False
+
+        await asyncio.sleep(1.5)
+        sent_user = await client.send_message(BOT_USERNAME, username)
+        
+        pln_button_found = False
+
+        for _ in range(30):
+            await asyncio.sleep(2)
+            messages = await client.get_messages(BOT_USERNAME, limit=10)
+            replies = [msg for msg in messages if not msg.out and msg.id > sent_user.id]
+            if not replies:
+                continue
+
+            for msg in replies:
+                raw_text = (msg.raw_text or "").casefold()
+                
+                if "akun tidak ditemukan" in raw_text or "gagal login" in raw_text or "belum punya nomor hp" in raw_text:
+                    return False
+
+                if msg.buttons:
+                    for row in msg.buttons:
+                        for btn in row:
+                            btn_label = (btn.text or "").lower()
+                            if any(kw in btn_label for kw in ['token pln 20.000', 'promo rp13.000', '20.000']):
+                                await btn.click()
+                                pln_button_found = True
+                                break
+                        if pln_button_found:
+                            break
+
+            if pln_button_found:
+                break
+
+        if not pln_button_found:
+            return False
+
+        prompt_meter_id = await wait_for_bot_prompt(
+            ['id pelanggan', 'no. meter pln', 'nomor meter', 'masukkan no', 'pilih nominal'], 
+            after_id=0, 
+            timeout=25
+        )
+        if not prompt_meter_id:
+            return False
+
+        await asyncio.sleep(1.5)
+        sent_meter = await client.send_message(BOT_USERNAME, pln_meter_number.strip())
+        
+        for _ in range(40):
+            await asyncio.sleep(2)
+            messages = await client.get_messages(BOT_USERNAME, limit=10)
+            replies = [msg for msg in messages if not msg.out and msg.id > sent_meter.id and msg.raw_text]
+            if not replies:
+                continue
+
+            for msg in replies:
+                raw_text = msg.raw_text
+                raw_lower = raw_text.lower()
+                
+                if 'pesanan berhasil' in raw_lower or 'berhasil' in raw_lower or 'va:' in raw_lower:
+                    va_match = re.search(r'VA:\s*(\d+)', raw_text)
+                    order_match = re.search(r'Order:\s*(\d+)', raw_text)
+                    
+                    va_num = va_match.group(1) if va_match else "-"
+                    order_num = order_match.group(1) if order_match else "-"
+                    
+                    log_entry = f"{username} | VA: {va_num} | Order: {order_num}"
+                    save_unique_success(OUTPUTS["VA"], log_entry)
+                    return True, va_num
+                
+                elif 'b00' in raw_lower or 'gagal' in raw_lower or 'credit risk' in raw_lower or 'error' in raw_lower:
+                    return False, "-"
+
+        return False, "-"
+    except Exception:
+        return False, "-"
+
+
+async def process_deals_voucher(username, deals_label, deals_link):
+    """5. /digital -> Deals -> Email / Username / ID -> Send Username -> Fingerprint Otomatis -> Send Link Deals -> Send 1 -> Tarik VA"""
+    try:
+        # 1. Kirim /digital
+        sent_digital = await client.send_message(BOT_USERNAME, '/digital')
+        
+        btn_deals_id = await click_button_by_keywords(['deals'], sent_digital.id)
+        if not btn_deals_id:
+            return False, "-"
+
+        btn_login_id = await click_button_by_keywords(['email / username', 'email', 'username', 'id'], 0)
+        if not btn_login_id:
+            return False, "-"
+
+        prompt_id = await wait_for_bot_prompt(['masukkan email', 'masukkan username', 'user id'], after_id=0)
+        if not prompt_id:
+            return False, "-"
+
+        await asyncio.sleep(1.5)
+        sent_user = await client.send_message(BOT_USERNAME, username)
+
+        # 2. Tunggu balasan login & klik tombol 'Fingerprint Otomatis'
+        fp_auto_found = False
+        for _ in range(30):
+            await asyncio.sleep(2)
+            messages = await client.get_messages(BOT_USERNAME, limit=10)
+            replies = [msg for msg in messages if not msg.out and msg.id > sent_user.id]
+            if not replies:
+                continue
+
+            for msg in replies:
+                raw_text = (msg.raw_text or "").casefold()
+                if "akun tidak ditemukan" in raw_text or "gagal login" in raw_text:
+                    return False, "-"
+
+                if msg.buttons:
+                    for row in msg.buttons:
+                        for btn in row:
+                            btn_txt = (btn.text or "").lower()
+                            if "fingerprint otomatis" in btn_txt or "fingerprint" in btn_txt:
+                                await btn.click()
+                                fp_auto_found = True
+                                break
+                        if fp_auto_found:
+                            break
+
+            if fp_auto_found:
+                break
+
+        if not fp_auto_found:
+            return False, "-"
+
+        # 3. Tunggu prompt meminta link Deals
+        prompt_link_id = await wait_for_bot_prompt(['masukkan link', 'kirim link', 'link deals'], after_id=0, timeout=25)
+        if not prompt_link_id:
+            return False, "-"
+
+        await asyncio.sleep(1.5)
+        sent_link = await client.send_message(BOT_USERNAME, deals_link)
+
+        # 4. Tunggu prompt kuantitas "Ketik jumlah yang mau dibeli (1-5):"
+        prompt_qty_id = await wait_for_bot_prompt(['ketik jumlah', 'mau dibeli', '1-5'], after_id=sent_link.id, timeout=25)
+        if not prompt_qty_id:
+            return False, "-"
+
+        await asyncio.sleep(1.5)
+        sent_qty = await client.send_message(BOT_USERNAME, "1")
+
+        # 5. Memeriksa pesan balasan "Pesanan berhasil dibuat!" & Ekstraksi VA
+        for _ in range(40):
+            await asyncio.sleep(2)
+            messages = await client.get_messages(BOT_USERNAME, limit=10)
+            replies = [msg for msg in messages if not msg.out and msg.id > sent_qty.id and msg.raw_text]
+            if not replies:
+                continue
+
+            for msg in replies:
+                raw_text = msg.raw_text
+                raw_lower = raw_text.lower()
+
+                if 'pesanan berhasil dibuat' in raw_lower or 'berhasil' in raw_lower or 'va:' in raw_lower:
+                    va_match = re.search(r'VA:\s*(\d+)', raw_text)
+                    order_match = re.search(r'Order:\s*(\d+)', raw_text)
+
+                    va_num = va_match.group(1) if va_match else "-"
+                    order_num = order_match.group(1) if order_match else "-"
+
+                    log_entry = f"{username} | {deals_label} | VA: {va_num} | Order: {order_num}"
+                    save_unique_success(OUTPUTS["DEALS"], log_entry)
+                    return True, va_num
+
+                elif 'gagal' in raw_lower or 'error' in raw_lower or 'habis' in raw_lower:
+                    return False, "-"
+
+        return False, "-"
+    except Exception:
+        return False, "-"
+
+
+def show_menu():
+    os.system('clear')
+    width = shutil.get_terminal_size().columns
+
+    art_lines = [
+        "      .----------------.      ",
+        "     /                  \\     ",
+        "    |     ()      ()     |    ",
+        "     \\        ^         /     ",
+        "      ||||||||||||||||||      ",
+        "     /                  \\     ",
+        "    /  /|   |    |   |\\  \\    ",
+        "   /_/  |___|____|___|  \\_\\   ",
+        "  [________________________]  "
+    ]
+
+    print(Fore.GREEN)
+    for line in art_lines:
+        print(line.center(width))
+
+    print(Fore.CYAN + "=" * width)
+    print(Fore.GREEN + "[x] SYSTEM ONLINE | TELETHON ENGINE ACTIVE".center(width))
+    print(Fore.CYAN + "=" * width)
+    print(Fore.YELLOW + "PILIH MENU UTAMA BOT CHECKER BY JOEMBOTH".center(width))
+    print(Fore.CYAN + "=" * width)
+    print(Fore.WHITE + "1. Daftar Akun Otomatis (Fingerprint Custom)")
+    print(Fore.WHITE + "2. Inject Voucher (SFood 25k + Ongkir 12k)")
+    print(Fore.WHITE + "3. Check Mission Coin & Filter Ganti Nomor (Sekali Jalan)")
+    print(Fore.WHITE + "4. Order Token PLN 20.000 (Spay)")
+    print(Fore.WHITE + "5. Claim Voucher Deals (Alfamart / Indomaret)")
+    print(Fore.CYAN + "=" * width)
+    pilihan = input(Fore.GREEN + "Masukkan pilihan (1/2/3/4/5): ").strip()
+    return pilihan
+
+
+async def main():
+    pilihan = show_menu()
+    if pilihan not in ["1", "2", "3", "4", "5"]:
+        print(Fore.RED + "Pilihan tidak valid!")
+        return
+
+    await client.start()
+
+    if pilihan == "1":
+        if not FINGERPRINT_FILE.exists() or not read_unique_lines(FINGERPRINT_FILE):
+            print(Fore.RED + f"File {FINGERPRINT_FILE} tidak ditemukan atau kosong! Siapkan dulu datanya via nano fingerprint.txt")
+            return
+
+        try:
+            jumlah_daftar = int(input(Fore.GREEN + "Masukkan target jumlah pendaftaran akun sukses: ").strip())
+        except ValueError:
+            print(Fore.RED + "Input angka tidak valid!")
+            return
+
+        table = PrettyTable()
+        table.field_names = ["NO", "PROSES REGISTRASI", "STATUS REGISTRASI"]
+        table.padding_width = 1
+        table.align = "c"
+
+        os.system('clear')
+        print(table)
+
+        last_msg_id = 0
+        sukses_count = 0
+        percobaan = 1
+
+        while sukses_count < jumlah_daftar:
+            is_first = (percobaan == 1)
+            reg_success, last_msg_id = await process_auto_register(is_first_run=is_first, last_msg_id=last_msg_id)
+
+            if reg_success:
+                sukses_count += 1
+                status_str = Fore.GREEN + "SUKSES" + Style.RESET_ALL
+                table.add_row([sukses_count, f"Daftar Akun ke-{sukses_count}", status_str])
+
+                os.system('clear')
+                print(table)
+
+            percobaan += 1
+            await asyncio.sleep(3)
+
+    elif pilihan == "4":
+        target_file = MISSION_FILE if MISSION_FILE.exists() else ACCOUNTS_FILE
+        if not target_file.exists():
+            print(Fore.RED + f"File {target_file} tidak ditemukan!")
+            return
+        accounts = read_unique_lines(target_file)
+        if not accounts:
+            print(Fore.RED + f"File {target_file} kosong!")
+            return
+
+        pln_meter_input = input(Fore.GREEN + "Masukkan No. Meter PLN: ").strip()
+        if not pln_meter_input:
+            print(Fore.RED + "No. Meter PLN tidak boleh kosong!")
+            return
+
+        try:
+            target_sukses = int(input(Fore.GREEN + f"Masukkan target jumlah order PLN sukses (Stok akun: {len(accounts)}): ").strip())
+        except ValueError:
+            print(Fore.RED + "Input angka tidak valid!")
+            return
+
+        table = PrettyTable()
+        table.field_names = ["NO", "AKUN TERORDER", "VA PEMBAYARAN", "STATUS ORDER PLN"]
+        table.padding_width = 1
+        table.align = "c"
+        table.align["AKUN TERORDER"] = "l"
+
+        os.system('clear')
+        print(table)
+
+        sukses_count = 0
+        for index, username in enumerate(accounts, start=1):
+            if sukses_count >= target_sukses:
+                print(Fore.GREEN + f"\n[!] Target {target_sukses} order PLN SUKSES telah tercapai!")
+                break
+
+            success, va_number = await process_pln_token(username, pln_meter_input)
+
+            if success:
+                sukses_count += 1
+                status_str = Fore.GREEN + "SUKSES" + Style.RESET_ALL
+                table.add_row([sukses_count, username, va_number, status_str])
+
+                os.system('clear')
+                print(table)
+
+            await asyncio.sleep(3)
+
+    elif pilihan == "5":
+        # Menu 5: Claim Voucher Deals
+        if not ACCOUNTS_FILE.exists():
+            print(Fore.RED + f"File {ACCOUNTS_FILE} tidak ditemukan!")
+            return
+        accounts = read_unique_lines(ACCOUNTS_FILE)
+        if not accounts:
+            print(Fore.RED + f"File {ACCOUNTS_FILE} kosong!")
+            return
+
+        print(Fore.CYAN + "\n================ PILIH VOUCHER DEALS ================")
+        print("1. Alfamart 25k")
+        print("2. Alfamart 50k")
+        print("3. Alfamart 100k")
+        print("4. Indomaret 25k")
+        print("5. Indomaret 50k")
+        print("6. Indomaret 100k")
+        sub_pilihan = input(Fore.GREEN + "Masukkan pilihan voucher (1-6): ").strip()
+
+        if sub_pilihan not in DEALS_VOUCHERS:
+            print(Fore.RED + "Pilihan voucher tidak valid!")
+            return
+
+        deals_label, deals_link = DEALS_VOUCHERS[sub_pilihan]
+
+        table = PrettyTable()
+        table.field_names = ["NO", f"TARGET AKUN ({len(accounts)})", "VA PEMBAYARAN", f"STATUS {deals_label.upper()}"]
+        table.padding_width = 1
+        table.align = "c"
+
+        os.system('clear')
+        print(table)
+
+        for index, username in enumerate(accounts, start=1):
+            success, va_number = await process_deals_voucher(username, deals_label, deals_link)
+            status_str = Fore.GREEN + "SUKSES" + Style.RESET_ALL if success else Fore.RED + "GAGAL" + Style.RESET_ALL
+            table.add_row([index, username, va_number, status_str])
+
+            os.system('clear')
+            print(table)
+            await asyncio.sleep(3)
+
+    else:
+        # Menu 2 & 3: Pemrosesan Akun Eksisting dari account.txt
+        if not ACCOUNTS_FILE.exists():
+            print(Fore.RED + f"File {ACCOUNTS_FILE} tidak ditemukan")
+            return
+        accounts = read_unique_lines(ACCOUNTS_FILE)
+        if not accounts:
+            print(Fore.RED + "account.txt kosong")
+            return
+
+        total_accounts = len(accounts)
+        target_header = f"TARGET AKUN {total_accounts}"
+        checkin_header = "CHECK-IN MISSION"
+        headers = ["NO", target_header]
+
+        if pilihan == "2":
+            headers.extend(["FOOD", "ONGKIR"])
+        elif pilihan == "3":
+            headers.extend([checkin_header, "GANTI NOMOR"])
+
+        table = PrettyTable()
+        table.field_names = headers
+        table.padding_width = 1
+        table.align = "c"
+        table.align[target_header] = "l"
+
+        os.system('clear')
+        print(table)
+
+        for index, username in enumerate(accounts, start=1):
+            row_status = []
+
+            if pilihan == "2":
+                for voucher_name, voucher_link in VOUCHERS.items():
+                    success = await process_claim_voucher(username, voucher_name, voucher_link)
+                    row_status.append(Fore.GREEN + "SUKSES" + Style.RESET_ALL if success else Fore.RED + "GAGAL" + Style.RESET_ALL)
+                    await asyncio.sleep(3)
+
+            elif pilihan == "3":
+                checkin_success = await process_mission_checkin(username)
+                row_status.append(Fore.GREEN + "SUKSES" + Style.RESET_ALL if checkin_success else Fore.RED + "GAGAL" + Style.RESET_ALL)
+                await asyncio.sleep(3)
+
+                ganti_nomor_success = await process_change_number(username)
+                row_status.append(Fore.GREEN + "SUKSES" + Style.RESET_ALL if ganti_nomor_success else Fore.RED + "GAGAL" + Style.RESET_ALL)
+                await asyncio.sleep(3)
+
+            table.add_row([index, username] + row_status)
+
+            os.system('clear')
+            print(table)
+
+            await asyncio.sleep(4)
+
+
+if __name__ == "__main__":
+    with client:
+        client.loop.run_until_complete(main())
